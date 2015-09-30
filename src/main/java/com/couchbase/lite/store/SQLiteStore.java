@@ -29,6 +29,9 @@ import com.couchbase.lite.storage.SQLException;
 import com.couchbase.lite.storage.SQLiteStorageEngine;
 import com.couchbase.lite.storage.SQLiteStorageEngineFactory;
 import com.couchbase.lite.support.RevisionUtils;
+import com.couchbase.lite.support.action.Action;
+import com.couchbase.lite.support.action.ActionBlock;
+import com.couchbase.lite.support.action.ActionException;
 import com.couchbase.lite.support.security.SymmetricKey;
 import com.couchbase.lite.util.Log;
 import com.couchbase.lite.util.SQLiteUtils;
@@ -46,7 +49,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-public class SQLiteStore implements Store {
+public class SQLiteStore implements Store, EncryptableStore {
     public String TAG = Log.TAG_DATABASE;
 
     public static String kDBFilename = "db.sqlite3";
@@ -117,6 +120,7 @@ public class SQLiteStore implements Store {
     private TransactionLevel transactionLevel;
     private StoreDelegate delegate;
     private int maxRevTreeDepth;
+    private SymmetricKey encryptionKey;
 
     ///////////////////////////////////////////////////////////////////////////
     // Constructor
@@ -169,7 +173,6 @@ public class SQLiteStore implements Store {
             // Open database:
             storageEngine.open(path);
             // Try to decrypt or access the database:
-            SymmetricKey encryptionKey = delegate.getEncryptionKey();
             decrypt(encryptionKey);
             isOpenSuccess = true;
         } catch (SQLException e) {
@@ -348,6 +351,120 @@ public class SQLiteStore implements Store {
                 cursor.close();
             }
         }
+    }
+
+    ///////////////////////////////////////////////////////////////////////////
+    // ENCRYPTABLE STORE
+    ///////////////////////////////////////////////////////////////////////////
+
+    @Override
+    public void setEncryptionKey(SymmetricKey key) {
+        encryptionKey = key;
+    }
+
+    @Override
+    public Action actionToChangeEncryptionKey(final SymmetricKey newKey) {
+        if (!storageEngine.supportEncryption()) {
+            return null;
+        }
+
+        Action action = new Action();
+        final AtomicBoolean dbWasClosed = new AtomicBoolean(false);
+
+        // Make a path for a tempoary database file:
+        final File tempFile = new File(manager.getDirectory(), Misc.CreateUUID());
+        action.add(null, new ActionBlock() {
+            @Override
+            public void execute() throws ActionException {
+                if (tempFile.exists()) {
+                    if (!tempFile.delete()) {
+                        throw new ActionException("Cannot delete temp database file " +
+                                tempFile.getAbsolutePath());
+                    }
+                }
+            }
+        }, null);
+
+        // Create & attach a temporary database encrypted with the new key:
+        action.add(
+            new ActionBlock() {
+                @Override
+                public void execute() throws ActionException {
+                    String keyStr = newKey != null ? newKey.getHexData() : "";
+                    String sql = "ATTACH DATABASE ? AS rekeyed_db KEY \"x'" + keyStr + "'\"";
+                    String[] args = {tempFile.getAbsolutePath()};
+                    try {
+                        storageEngine.execSQL(sql, args);
+                    } catch (Exception e) {
+                        throw new ActionException(e);
+                    }
+                }
+            }, new ActionBlock() {
+                @Override
+                public void execute() throws ActionException {
+                    if (dbWasClosed.get())
+                        return;
+                    try {
+                        storageEngine.execSQL("DETACH DATABASE rekeyed_db");
+                    } catch (Exception e) {
+                        throw new ActionException(e);
+                    }
+                }
+            });
+
+        // Export the current database's contents to the new one:
+        action.add(new ActionBlock() {
+            @Override
+            public void execute() throws ActionException {
+                try {
+                    int dbVersion = storageEngine.getVersion();
+                    storageEngine.execSQL("SELECT sqlcipher_export('rekeyed_db')");
+                    storageEngine.execSQL("PRAGMA rekeyed_db.user_version = " + dbVersion);
+                } catch (Exception e) {
+                    throw new ActionException(e);
+                }
+            }
+        }, null, null);
+
+        // Close the database (and re-open it on cleanup):
+        action.add(
+            new ActionBlock() {
+                @Override
+                public void execute() throws ActionException {
+                    storageEngine.close();
+                    dbWasClosed.set(true);
+                }
+            },
+            new ActionBlock() {
+                @Override
+                public void execute() throws ActionException {
+                    try {
+                        if (!open())
+                            throw new ActionException("Cannot open the SQLiteStore");
+                    } catch (CouchbaseLiteException e) {
+                        throw new ActionException(e);
+                    }
+                }
+            },
+            new ActionBlock() {
+                @Override
+                public void execute() throws ActionException {
+                    setEncryptionKey(newKey);
+                    try {
+                        if (!open())
+                            throw new ActionException("Cannot open the SQLiteStore");
+                    } catch (CouchbaseLiteException e) {
+                        throw new ActionException(e);
+                    }
+                }
+            }
+        );
+
+        // Overwrite the old db file with the new one:
+        action.add(Action.moveAndReplaceFile(tempFile.getAbsolutePath(), path,
+                manager.getContext().getTempDir().getAbsolutePath()));
+
+        return action;
     }
 
     ///////////////////////////////////////////////////////////////////////////
